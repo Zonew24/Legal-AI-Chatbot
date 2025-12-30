@@ -3,8 +3,7 @@ import os
 import glob
 import torch
 
-
-# Fix lỗi xung đột torch và streamlit trên Windows
+# Fix lỗi torch trên Windows
 try:
     if hasattr(torch, 'classes'):
         torch.classes.__path__ = []
@@ -16,117 +15,105 @@ from langchain_community.vectorstores import Chroma
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_core.prompts import PromptTemplate
 
-# Config
 st.set_page_config(page_title="Legal Chatbot", layout="wide")
-st.title("Legal AI Chatbot")
+st.title("Trợ lý Luật sư AI")
 
-# Sidebar chỉnh tham số
-with st.sidebar:
-    st.header("Cấu hình")
-    k_retrieval = st.slider("Số docs tham khảo (K)", 1, 10, 2, help="Ít docs thì chạy nhanh hơn")
+# Sidebar
+k_retrieval = st.sidebar.slider("Số lượng tài liệu tham khảo", 1, 10, 2)
 
-# Model
+# Path
 DB_PATH = "chroma_db"
 MODEL_DIR = "models"
 
-def get_model_path():
-    print(f"Scanning models in: {os.path.abspath(MODEL_DIR)}")
-    # Tìm tất cả file .gguf
-    all_ggufs = glob.glob(os.path.join(MODEL_DIR, "*.gguf"))
-    
-    if not all_ggufs:
-        return None
-        
-    # Ưu tiên tìm bản 7B
-    for path in all_ggufs:
-        if "7b" in path.lower():
-            return path
-    return all_ggufs[0]
-
-# Cache resource để không phải load lại model mỗi lần F5
 @st.cache_resource
-def load_engine():
-    model_path = get_model_path()
-    
-    # In ra đường dẫn
-    if model_path:
-        print(f"--> Found Model: {model_path}")
-    else:
-        print("--> No model found!")
-        return None, None
+def load_resources():
+    """Hàm load model và database, dùng cache để không load lại khi reload trang"""
 
-    # Embedding model (Chạy CPU ok)
+    # 1. Tìm file model .gguf
+    model_files = glob.glob(os.path.join(MODEL_DIR, "*.gguf"))
+    if not model_files:
+        return None, None
+    
+    model_path = model_files[0]
+    print(f"Loading model from: {model_path}")
+
+    # 2. Load Embedding Model bằng CPU
     embed = HuggingFaceEmbeddings(
         model_name="bkai-foundation-models/vietnamese-bi-encoder",
         model_kwargs={'device': 'cpu'}
     )
-    
-    # Load LLM (LlamaCpp)
-    # n_gpu_layers=0 nghĩa là chạy full CPU. Nếu có Card rời thì tăng lên 20-30.
+
+    # 3. Load LLM
     llm = LlamaCpp(
         model_path=model_path,
-        n_ctx=8192,
-        n_batch=512,
-        temperature=0.1,
-        max_tokens=1024,
-        n_gpu_layers=0,  # Chạy full CPU.
+        n_ctx=8192,          # Context window
+        n_batch=512,         # Batch size
+        temperature=0.1,     # Giảm độ sáng tạo để bot trả lời đúng luật
+        max_tokens=1024,     # Độ dài câu trả lời tối đa
+        n_gpu_layers=0,      # Chạy CPU
         verbose=False
     )
-    
-    # Load Vector DB
+
+    # 4. Load Vector Database
     db = None
     if os.path.exists(DB_PATH):
         db = Chroma(persist_directory=DB_PATH, embedding_function=embed)
-        
+
     return llm, db
 
-llm, db = load_engine()
+# Khởi tạo model
+llm, db = load_resources()
+if not llm:
+    st.error("Lỗi: Không tìm thấy file .gguf trong thư mục models/. Vui lòng tải model về!")
+    st.stop()
 
-# Chat UI
+# Chatbot
 if "history" not in st.session_state:
-    st.session_state.history = [{"role": "assistant", "content": "Chào bạn, tôi là AI tư vấn luật tại Việt Nam. Tôi có thể giúp gì cho bạn hôm nay?"}]
+    st.session_state.history = [{"role": "assistant", "content": "Chào bạn, tôi là AI trợ lý pháp luật. Tôi có thể giúp gì được cho bạn nhỉ?"}]
 
-# Render tin nhắn cũ
+# Hiển thị lịch sử chat
 for msg in st.session_state.history:
     st.chat_message(msg["role"]).write(msg["content"])
 
-# Xử lý tin nhắn mới
-if user_input := st.chat_input("Nhập câu hỏi..."):
-    # Hiện câu hỏi user
-    st.session_state.history.append({"role": "user", "content": user_input})
-    st.chat_message("user").write(user_input)
-    
+# Xử lý khi người dùng nhập câu hỏi
+if prompt := st.chat_input("Nhập câu hỏi..."):
+    # Lưu và hiện câu hỏi của user
+    st.session_state.history.append({"role": "user", "content": prompt})
+    st.chat_message("user").write(prompt)
+
     with st.chat_message("assistant"):
-        with st.spinner("Đang suy nghĩ..."):
-            
+        with st.spinner("Đang xử lý..."):
             # Retrieve
-            context_text = ""
+            context = ""
             refs = []
             if db:
-                docs = db.similarity_search(user_input, k=k_retrieval)
-                context_text = "\n\n".join([d.page_content for d in docs])
+                docs = db.similarity_search(prompt, k=k_retrieval)
+                context = "\n\n".join([d.page_content for d in docs])
                 refs = docs
             
-            #Prompting
-            template = """<|im_start|>system
+            # Prompt Engineering
+            template = """### Instruction:
             Bạn là trợ lý luật sư. Trả lời dựa trên ngữ cảnh được cung cấp.
-            Format: Căn cứ theo -> Nội dung -> Kết luận.
+            Format câu trả lời: Căn cứ theo -> Nội dung -> Kết luận.
             
             Ngữ cảnh:
-            {context}<|im_end|>
-            <|im_start|>user
-            {question}<|im_end|>
-            <|im_start|>assistant"""
+            {context}
+
+            ### Input:
+            {question}
+
+            ### Response:"""
             
-            prompt_template = PromptTemplate(template=template, input_variables=["context", "question"])
-            final_prompt = prompt_template.format(context=context_text, question=user_input)
+            p_template = PromptTemplate(template=template, input_variables=["context", "question"])
+            final_prompt = p_template.format(context=context, question=prompt)
             
             # Generate
             response = llm.invoke(final_prompt)
             
-            # Source
+            # References
             if refs:
-                response += "\n\n**Nguồn tham khảo:**\n" + "\n".join([f"- {d.metadata.get('source', 'Unknown')}" for d in refs])
+                response += "\n\n**Nguồn:**\n" + "\n".join([f"- {d.metadata.get('source', 'Unknown')}" for d in refs])
             
+            # Hiển thị và lưu câu trả lời
             st.write(response)
             st.session_state.history.append({"role": "assistant", "content": response})
